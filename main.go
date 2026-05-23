@@ -14,7 +14,7 @@ import (
 	"sync/atomic"
 )
 
-type result struct {
+type problem struct {
 	relPath string
 	status  string // "missing", "size_mismatch", "hash_mismatch", "read_error"
 	detail  string
@@ -85,40 +85,46 @@ func collectFiles(root string, imagesOnly bool) ([]string, error) {
 	return files, err
 }
 
-func checkOne(rel, src, dst string, quickSize bool) *result {
-	srcPath := filepath.Join(src, rel)
-	dstPath := filepath.Join(dst, rel)
+// runParallel calls fn on each item using `workers` goroutines, prints a
+// progress counter to stderr, and returns any non-nil problems plus the items
+// for which fn returned nil (i.e. survived this phase).
+func runParallel(label string, items []string, workers int, fn func(string) *problem) (problems []problem, passed []string) {
+	if len(items) == 0 {
+		return nil, nil
+	}
+	total := int64(len(items))
+	jobs := make(chan string, workers*2)
+	var mu sync.Mutex
+	var done int64
 
-	si, err := os.Stat(srcPath)
-	if err != nil {
-		return &result{rel, "read_error", fmt.Sprintf("source: %v", err)}
+	var wg sync.WaitGroup
+	for i := 0; i < workers; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			for rel := range jobs {
+				p := fn(rel)
+				mu.Lock()
+				if p != nil {
+					problems = append(problems, *p)
+				} else {
+					passed = append(passed, rel)
+				}
+				mu.Unlock()
+				d := atomic.AddInt64(&done, 1)
+				if d == total || d%100 == 0 {
+					fmt.Fprintf(os.Stderr, "\r%s %d / %d", label, d, total)
+				}
+			}
+		}()
 	}
-	di, err := os.Stat(dstPath)
-	if err != nil {
-		if os.IsNotExist(err) {
-			return &result{rel, "missing", "not present in copy"}
-		}
-		return &result{rel, "read_error", fmt.Sprintf("copy: %v", err)}
+	for _, it := range items {
+		jobs <- it
 	}
-	if si.Size() != di.Size() {
-		return &result{rel, "size_mismatch",
-			fmt.Sprintf("src=%d bytes, copy=%d bytes", si.Size(), di.Size())}
-	}
-	if quickSize {
-		return nil
-	}
-	sh, err := hashFile(srcPath)
-	if err != nil {
-		return &result{rel, "read_error", fmt.Sprintf("hash source: %v", err)}
-	}
-	dh, err := hashFile(dstPath)
-	if err != nil {
-		return &result{rel, "read_error", fmt.Sprintf("hash copy: %v", err)}
-	}
-	if string(sh) != string(dh) {
-		return &result{rel, "hash_mismatch", "content differs"}
-	}
-	return nil
+	close(jobs)
+	wg.Wait()
+	fmt.Fprintln(os.Stderr)
+	return problems, passed
 }
 
 func main() {
@@ -130,7 +136,7 @@ func main() {
 	flag.Parse()
 
 	if *src == "" || *dst == "" {
-		fmt.Fprintln(os.Stderr, "usage: photo_check -src <source-dir> -dst <copy-dir> [-workers N] [-images-only=false] [-quick]")
+		fmt.Fprintln(os.Stderr, "usage: photo-copy-check -src <source-dir> -dst <copy-dir> [-workers N] [-images-only=false] [-quick]")
 		os.Exit(2)
 	}
 	if *workers < 1 {
@@ -149,45 +155,75 @@ func main() {
 		os.Exit(2)
 	}
 
-	fmt.Printf("Scanning source: %s\n", srcResolved)
-	files, err := collectFiles(srcResolved, *imagesOnly)
+	// Phase 1: list comparison — walk both trees, diff the relative paths.
+	fmt.Println("Phase 1/3: scanning file lists...")
+	srcFiles, err := collectFiles(srcResolved, *imagesOnly)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "failed to scan source: %v\n", err)
 		os.Exit(1)
 	}
-	total := int64(len(files))
-	fmt.Printf("Found %d file(s). Verifying with %d worker(s)...\n", total, *workers)
+	dstFiles, err := collectFiles(dstResolved, *imagesOnly)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "failed to scan destination: %v\n", err)
+		os.Exit(1)
+	}
+	dstSet := make(map[string]struct{}, len(dstFiles))
+	for _, f := range dstFiles {
+		dstSet[f] = struct{}{}
+	}
+	var problems []problem
+	var bothPresent []string
+	for _, rel := range srcFiles {
+		if _, ok := dstSet[rel]; ok {
+			bothPresent = append(bothPresent, rel)
+		} else {
+			problems = append(problems, problem{rel, "missing", "not present in copy"})
+		}
+	}
+	total := len(srcFiles)
+	fmt.Printf("  source: %d, destination: %d, present in both: %d, missing: %d\n",
+		len(srcFiles), len(dstFiles), len(bothPresent), total-len(bothPresent))
 
-	jobs := make(chan string, *workers*2)
-	var problems []result
-	var mu sync.Mutex
-	var done int64
+	// Phase 2: byte-length comparison — stat both sides, compare sizes.
+	fmt.Printf("Phase 2/3: comparing byte lengths (%d file(s))...\n", len(bothPresent))
+	sizeProblems, sizeMatched := runParallel("  sized", bothPresent, *workers, func(rel string) *problem {
+		si, err := os.Stat(filepath.Join(srcResolved, rel))
+		if err != nil {
+			return &problem{rel, "read_error", fmt.Sprintf("source: %v", err)}
+		}
+		di, err := os.Stat(filepath.Join(dstResolved, rel))
+		if err != nil {
+			return &problem{rel, "read_error", fmt.Sprintf("copy: %v", err)}
+		}
+		if si.Size() != di.Size() {
+			return &problem{rel, "size_mismatch",
+				fmt.Sprintf("src=%d bytes, copy=%d bytes", si.Size(), di.Size())}
+		}
+		return nil
+	})
+	problems = append(problems, sizeProblems...)
 
-	var wg sync.WaitGroup
-	for i := 0; i < *workers; i++ {
-		wg.Add(1)
-		go func() {
-			defer wg.Done()
-			for rel := range jobs {
-				if r := checkOne(rel, srcResolved, dstResolved, *quickSize); r != nil {
-					mu.Lock()
-					problems = append(problems, *r)
-					mu.Unlock()
-				}
-				d := atomic.AddInt64(&done, 1)
-				if d == total || d%100 == 0 {
-					fmt.Fprintf(os.Stderr, "\rchecked %d / %d", d, total)
-				}
+	// Phase 3: SHA-256 — only files that survived phase 2.
+	if *quickSize {
+		fmt.Println("Phase 3/3: skipped (-quick).")
+	} else {
+		fmt.Printf("Phase 3/3: comparing SHA-256 (%d file(s))...\n", len(sizeMatched))
+		hashProblems, _ := runParallel("  hashed", sizeMatched, *workers, func(rel string) *problem {
+			sh, err := hashFile(filepath.Join(srcResolved, rel))
+			if err != nil {
+				return &problem{rel, "read_error", fmt.Sprintf("hash source: %v", err)}
 			}
-		}()
+			dh, err := hashFile(filepath.Join(dstResolved, rel))
+			if err != nil {
+				return &problem{rel, "read_error", fmt.Sprintf("hash copy: %v", err)}
+			}
+			if string(sh) != string(dh) {
+				return &problem{rel, "hash_mismatch", "content differs"}
+			}
+			return nil
+		})
+		problems = append(problems, hashProblems...)
 	}
-
-	for _, rel := range files {
-		jobs <- rel
-	}
-	close(jobs)
-	wg.Wait()
-	fmt.Fprintln(os.Stderr)
 
 	if len(problems) == 0 {
 		fmt.Printf("OK: all %d file(s) match.\n", total)

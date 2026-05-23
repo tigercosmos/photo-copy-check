@@ -1,30 +1,37 @@
-# photo_check
+# photo-copy-check
 
 A small, parallel CLI that verifies every file in a **source** directory has a
 byte-identical copy in a **destination** directory. Built for the "did my SD
 card actually copy to disk before I wipe it?" moment.
 
-For each file it checks, in order:
+Verification runs in three sequential phases, cheapest first. Each phase only
+processes files that survived the previous one, so a broken copy fails fast
+without ever paying for the hash pass:
 
-1. The file exists in the destination at the same relative path.
-2. The sizes match.
-3. The SHA-256 hashes match (skippable with `-quick`).
+1. **List comparison** — walk both trees once, diff the relative paths. Files
+   only in the source are reported as `missing`.
+2. **Byte-length comparison** — for files present in both, `stat` both sides
+   in parallel and compare sizes. Mismatches are reported as `size_mismatch`.
+3. **SHA-256 comparison** — for files whose sizes matched, hash both sides in
+   parallel and compare. Mismatches are reported as `hash_mismatch`. Skipped
+   entirely with `-quick`.
 
-Work is dispatched to a worker pool sized to `runtime.NumCPU()` by default,
-so big trees finish in roughly disk-read time rather than file-by-file time.
+Phases 2 and 3 are dispatched to a worker pool sized to `runtime.NumCPU()` by
+default, so big trees finish in roughly disk-read time rather than
+file-by-file time.
 
 ## Build
 
 Requires Go 1.20+.
 
 ```sh
-go build -o photo_check .
+go build -o photo-copy-check .
 ```
 
 ## Usage
 
 ```sh
-./photo_check -src <source-dir> -dst <copy-dir> [flags]
+./photo-copy-check -src <source-dir> -dst <copy-dir> [flags]
 ```
 
 | Flag             | Default        | Description                                                     |
@@ -47,7 +54,7 @@ symlinked source directory works as expected.
 Verify an SD card copy:
 
 ```sh
-./photo_check \
+./photo-copy-check \
   -src /Volumes/Untitled/DCIM/100MSDCF \
   -dst ~/Pictures/2026-05-08-Spain
 ```
@@ -55,13 +62,13 @@ Verify an SD card copy:
 Verify every file (not just images), with explicit worker count:
 
 ```sh
-./photo_check -src ./src -dst ./backup -images-only=false -workers 8
+./photo-copy-check -src ./src -dst ./backup -images-only=false -workers 8
 ```
 
 Quick size-only sweep (useful as a first pass over a huge tree):
 
 ```sh
-./photo_check -src ./src -dst ./backup -quick
+./photo-copy-check -src ./src -dst ./backup -quick
 ```
 
 ## Output
@@ -102,7 +109,7 @@ Statuses:
 Useful in scripts:
 
 ```sh
-if ./photo_check -src "$CARD" -dst "$BACKUP"; then
+if ./photo-copy-check -src "$CARD" -dst "$BACKUP"; then
     diskutil eject "$CARD"
 fi
 ```
