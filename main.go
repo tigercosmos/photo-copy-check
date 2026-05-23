@@ -45,6 +45,24 @@ func hashFile(path string) ([]byte, error) {
 	return h.Sum(nil), nil
 }
 
+// resolveDir resolves symlinks on the given path and confirms it points at a
+// directory. filepath.Walk uses Lstat on the root, so passing a symlinked
+// directory would otherwise be skipped silently.
+func resolveDir(path string) (string, error) {
+	resolved, err := filepath.EvalSymlinks(path)
+	if err != nil {
+		return "", err
+	}
+	info, err := os.Stat(resolved)
+	if err != nil {
+		return "", err
+	}
+	if !info.IsDir() {
+		return "", fmt.Errorf("%s is not a directory", resolved)
+	}
+	return resolved, nil
+}
+
 func collectFiles(root string, imagesOnly bool) ([]string, error) {
 	var files []string
 	err := filepath.Walk(root, func(path string, info os.FileInfo, err error) error {
@@ -115,18 +133,24 @@ func main() {
 		fmt.Fprintln(os.Stderr, "usage: photo_check -src <source-dir> -dst <copy-dir> [-workers N] [-images-only=false] [-quick]")
 		os.Exit(2)
 	}
+	if *workers < 1 {
+		fmt.Fprintf(os.Stderr, "workers must be >= 1 (got %d)\n", *workers)
+		os.Exit(2)
+	}
 
-	if si, err := os.Stat(*src); err != nil || !si.IsDir() {
+	srcResolved, err := resolveDir(*src)
+	if err != nil {
 		fmt.Fprintf(os.Stderr, "source is not a readable directory: %v\n", err)
 		os.Exit(2)
 	}
-	if di, err := os.Stat(*dst); err != nil || !di.IsDir() {
+	dstResolved, err := resolveDir(*dst)
+	if err != nil {
 		fmt.Fprintf(os.Stderr, "destination is not a readable directory: %v\n", err)
 		os.Exit(2)
 	}
 
-	fmt.Printf("Scanning source: %s\n", *src)
-	files, err := collectFiles(*src, *imagesOnly)
+	fmt.Printf("Scanning source: %s\n", srcResolved)
+	files, err := collectFiles(srcResolved, *imagesOnly)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "failed to scan source: %v\n", err)
 		os.Exit(1)
@@ -145,7 +169,7 @@ func main() {
 		go func() {
 			defer wg.Done()
 			for rel := range jobs {
-				if r := checkOne(rel, *src, *dst, *quickSize); r != nil {
+				if r := checkOne(rel, srcResolved, dstResolved, *quickSize); r != nil {
 					mu.Lock()
 					problems = append(problems, *r)
 					mu.Unlock()
