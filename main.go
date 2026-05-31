@@ -1,6 +1,7 @@
 package main
 
 import (
+	"bytes"
 	"crypto/sha256"
 	"flag"
 	"fmt"
@@ -16,7 +17,7 @@ import (
 
 type problem struct {
 	relPath string
-	status  string // "missing", "size_mismatch", "hash_mismatch", "read_error"
+	status  string // "missing", "extra", "size_mismatch", "hash_mismatch", "read_error"
 	detail  string
 }
 
@@ -136,7 +137,7 @@ func main() {
 	flag.Parse()
 
 	if *src == "" || *dst == "" {
-		fmt.Fprintln(os.Stderr, "usage: photo-copy-check -src <source-dir> -dst <copy-dir> [-workers N] [-images-only=false] [-quick]")
+		fmt.Fprintf(os.Stderr, "usage: %s -src <source-dir> -dst <copy-dir> [-workers N] [-images-only=false] [-quick]\n", filepath.Base(os.Args[0]))
 		os.Exit(2)
 	}
 	if *workers < 1 {
@@ -171,6 +172,10 @@ func main() {
 	for _, f := range dstFiles {
 		dstSet[f] = struct{}{}
 	}
+	srcSet := make(map[string]struct{}, len(srcFiles))
+	for _, f := range srcFiles {
+		srcSet[f] = struct{}{}
+	}
 	var problems []problem
 	var bothPresent []string
 	for _, rel := range srcFiles {
@@ -180,9 +185,14 @@ func main() {
 			problems = append(problems, problem{rel, "missing", "not present in copy"})
 		}
 	}
+	for _, rel := range dstFiles {
+		if _, ok := srcSet[rel]; !ok {
+			problems = append(problems, problem{rel, "extra", "present in copy but not in source"})
+		}
+	}
 	total := len(srcFiles)
-	fmt.Printf("  source: %d, destination: %d, present in both: %d, missing: %d\n",
-		len(srcFiles), len(dstFiles), len(bothPresent), total-len(bothPresent))
+	fmt.Printf("  source: %d, destination: %d, present in both: %d, missing: %d, extra: %d\n",
+		len(srcFiles), len(dstFiles), len(bothPresent), total-len(bothPresent), len(dstFiles)-len(bothPresent))
 
 	// Phase 2: byte-length comparison — stat both sides, compare sizes.
 	fmt.Printf("Phase 2/3: comparing byte lengths (%d file(s))...\n", len(bothPresent))
@@ -217,7 +227,7 @@ func main() {
 			if err != nil {
 				return &problem{rel, "read_error", fmt.Sprintf("hash copy: %v", err)}
 			}
-			if string(sh) != string(dh) {
+			if !bytes.Equal(sh, dh) {
 				return &problem{rel, "hash_mismatch", "content differs"}
 			}
 			return nil
@@ -243,7 +253,7 @@ func main() {
 	}
 
 	fmt.Printf("FAIL: %d file(s) had issues out of %d.\n", len(problems), total)
-	for _, k := range []string{"missing", "size_mismatch", "hash_mismatch", "read_error"} {
+	for _, k := range []string{"missing", "extra", "size_mismatch", "hash_mismatch", "read_error"} {
 		if counts[k] > 0 {
 			fmt.Printf("  %s: %d\n", k, counts[k])
 		}

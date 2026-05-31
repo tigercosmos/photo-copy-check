@@ -1,1 +1,4 @@
-/photo_check
+/photo_copy_check
+/log/
+*.test
+coverage.out
